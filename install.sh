@@ -806,7 +806,6 @@ manage_entries() {
         menu_item 2 '删除规则'
         menu_item 3 '修改规则'
         menu_item 4 '查看规则'
-        printf '\n'
         menu_item 0 '返回主菜单'
         read -r -p '请输入选项 [0-4]：' choice || return
         case "$choice" in
@@ -869,12 +868,9 @@ menu() {
         [ "$foreign_enabled" -eq 1 ] && foreign_action='关闭屏蔽国外 IP' || foreign_action='开启屏蔽国外 IP'
         menu_item 1 "$cn_action"
         menu_item 2 "$foreign_action"
-        printf '\n'
         menu_item 3 '白名单管理'
         menu_item 4 '手工屏蔽管理'
-        printf '\n'
         menu_item 5 '一键卸载清理'
-        printf '\n'
         menu_item 0 '退出'
         read -r -p '请输入选项 [0-5]：' choice || { printf '\n'; return; }
         case "$choice" in
