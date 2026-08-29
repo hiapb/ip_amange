@@ -16,7 +16,10 @@ readonly IPSET_WHITELIST="blockip_whitelist"
 readonly IPSET_BLOCKLIST="blockip_blocklist"
 readonly IPSET_CN="blockip_cn"
 readonly UPDATE_MAX_AGE=604800
+# Domain records are refreshed at most once per hour when rules are applied.
+readonly DNS_CACHE_TTL=3600
 readonly CRON_FILE="/etc/cron.d/blockip"
+readonly DNS_CACHE_DIR="${STATE_DIR}/dns-cache"
 
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -60,6 +63,7 @@ install_dependencies() {
     have_cmd readlink || packages+=(coreutils)
     have_cmd sort || packages+=(coreutils)
     have_cmd tr || packages+=(coreutils)
+    have_cmd sha256sum || have_cmd cksum || packages+=(coreutils)
     if have_cmd dpkg-query && ! dpkg-query -W -f='${Status}' ca-certificates 2>/dev/null | grep -q 'install ok installed'; then
         packages+=(ca-certificates)
     fi
@@ -155,11 +159,30 @@ create_set() {
 }
 
 resolve_domain() {
-    local domain=$1 ip
+    local domain=$1 ip now modified age cache_file cache_key ips
     have_cmd getent || return 0
+    mkdir -p "$DNS_CACHE_DIR"
+    if have_cmd sha256sum; then
+        cache_key=$(printf '%s' "$domain" | sha256sum | awk '{print $1}')
+    else
+        cache_key=$(printf '%s' "$domain" | cksum | awk '{print $1}')
+    fi
+    cache_file="${DNS_CACHE_DIR}/${cache_key}.ipv4"
+    now=$(date +%s)
+    if [ -s "$cache_file" ]; then
+        modified=$(stat -c %Y "$cache_file" 2>/dev/null || printf 0)
+        age=$((now - modified))
+        if [ "$age" -lt "$DNS_CACHE_TTL" ]; then
+            cat "$cache_file"
+            return 0
+        fi
+    fi
+    ips=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u)
+    : > "$cache_file"
     while read -r ip; do
-        valid_ipv4_or_cidr "$ip" && printf '%s\n' "$ip"
-    done < <(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u)
+        valid_ipv4_or_cidr "$ip" && printf '%s\n' "$ip" >> "$cache_file"
+    done <<< "$ips"
+    cat "$cache_file"
 }
 
 populate_set_from_file() {
@@ -328,8 +351,11 @@ read_entry_value() {
         NET) read -r -p '请输入 IPv4 网段（例如 203.0.113.0/24）：' value ;;
         DOMAIN) read -r -p '请输入域名（例如 example.com）：' value ;;
     esac
+    value=$(printf '%s' "$value" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    [ -n "$value" ] || { red '输入不能为空。'; return 1; }
     if [ "$kind" = DOMAIN ]; then
         valid_domain "$value" || { red '域名格式不正确。'; return 1; }
+        resolve_domain "$value" | grep -q . || { red '域名没有解析到 IPv4 地址，请检查域名或 DNS。'; return 1; }
     else
         valid_ipv4_or_cidr "$value" || { red 'IPv4 地址或网段格式不正确。'; return 1; }
     fi
@@ -374,8 +400,8 @@ delete_entry() {
     current=$(sed -n "${line}p" "$file")
     [ -n "$current" ] || { red '找不到这个编号。'; return; }
     printf '即将删除：%s\n' "${current#*|}"
-    read -r -p '确认删除？[y/N]：' confirm
-    [[ "$confirm" =~ ^[Yy]$ ]] || { yellow '已取消删除。'; return; }
+    read -r -p '确认删除？[y/N]（回车默认 y）：' confirm
+    [[ -z "$confirm" || "$confirm" =~ ^[Yy]$ ]] || { yellow '已取消删除。'; return; }
     tmp=$(mktemp)
     awk -v n="$line" 'NR != n' "$file" > "$tmp" && mv "$tmp" "$file"
     apply_and_save
@@ -397,6 +423,10 @@ edit_entry() {
     choose_entry_type || return
     printf '\n'
     read_entry_value "$SELECTED_KIND" || return
+    if awk -F'|' -v value="$ENTRY_VALUE" '$2 == value { found=1 } END { exit found ? 0 : 1 }' "$file"; then
+        yellow '这条规则已经存在，无需重复添加。'
+        return
+    fi
     tmp=$(mktemp)
     awk -v n="$line" -v replacement="$SELECTED_KIND|$ENTRY_VALUE" 'NR == n { print replacement; next } { print }' "$file" > "$tmp" && mv "$tmp" "$file"
     apply_and_save
@@ -413,10 +443,7 @@ show_status() {
         *) cn_status='关闭'; foreign_status='关闭' ;;
     esac
     printf '\n国内 IP 屏蔽：%s    国外 IP 屏蔽：%s\n' "$cn_status" "$foreign_status"
-    printf '当前规则：%s\n' "$(mode_label "$mode")"
-    printf '白名单：%s 条配置，手工屏蔽：%s 条配置\n' "$(grep -c . "$WHITELIST_FILE" 2>/dev/null || true)" "$(grep -c . "$BLOCKLIST_FILE" 2>/dev/null || true)"
-    [ -f "$CRON_FILE" ] && printf '国内 IP 列表：已启用每周自动更新\n' || printf '国内 IP 列表：首次启用地域屏蔽时自动下载\n'
-    ipset list "$IPSET_CN" 2>/dev/null | awk '/Number of entries:/ {print "国内网段：" $NF " 条（列表更新时间：" strftime("%Y-%m-%d %H:%M:%S") "）"; exit}' || true
+    printf '白名单：%s 条    手工屏蔽：%s 条\n' "$(grep -c . "$WHITELIST_FILE" 2>/dev/null || true)" "$(grep -c . "$BLOCKLIST_FILE" 2>/dev/null || true)"
 }
 
 pause_menu() {
@@ -463,6 +490,8 @@ uninstall_cleanup() {
         ipset destroy "$IPSET_CN" 2>/dev/null || true
     fi
     rm -f "$CRON_FILE" "$MODE_FILE" "$WHITELIST_FILE" "$BLOCKLIST_FILE" "$CN_ZONE"
+    rm -f "$DNS_CACHE_DIR"/* 2>/dev/null || true
+    rmdir "$DNS_CACHE_DIR" 2>/dev/null || true
     rmdir "$STATE_DIR" 2>/dev/null || true
     if have_cmd netfilter-persistent; then
         netfilter-persistent save >/dev/null 2>&1 || true
@@ -479,7 +508,6 @@ menu() {
     local mode cn_enabled foreign_enabled cn_action foreign_action choice confirm
     while true; do
         screen_title 'blockip 防火墙管理'
-        show_status
         mode=$(tr -d '[:space:]' < "$MODE_FILE")
         cn_enabled=0
         foreign_enabled=0
@@ -496,8 +524,8 @@ menu() {
         printf '%s\n' '4. 手工屏蔽管理'
         printf '%s\n' '5. 查看当前规则'
         printf '%s\n' '6. 一键卸载清理'
-        printf '%s\n\n' '0. 退出'
-        read -r -p '请输入选项 [0-6]：' choice
+        printf '%s\n\n' '7. 退出'
+        read -r -p '请输入选项 [1-7]：' choice
         case "$choice" in
             1)
                 if [ "$cn_enabled" -eq 1 ]; then toggle_region cn off; else toggle_region cn on; fi
@@ -507,15 +535,21 @@ menu() {
                     toggle_region foreign off
                 else
                     yellow '警告：开启后，国外来源的新连接会被拒绝；如果当前已开启国内屏蔽，则两边都会被拒绝。'
-                    read -r -p '确定继续？输入 yes 确认：' confirm
-                    [ "$confirm" = yes ] && toggle_region foreign on
+                    read -r -p '确认开启？[y/N]（回车默认 y）：' confirm
+                    [[ -z "$confirm" || "$confirm" =~ ^[Yy]$ ]] && toggle_region foreign on
                 fi
                 ;;
-            3) manage_entries "$WHITELIST_FILE" '白名单管理' ;;
-            4) manage_entries "$BLOCKLIST_FILE" '手工屏蔽管理' ;;
-            5) clear 2>/dev/null || true; iptables -S "$CHAIN" 2>/dev/null || yellow '当前还没有应用 blockip 规则。'; pause_menu ;;
+            3) manage_entries "$WHITELIST_FILE" '白名单（允许列表）' ;;
+            4) manage_entries "$BLOCKLIST_FILE" '手工屏蔽（拒绝列表）' ;;
+            5)
+                screen_title '当前规则'
+                show_status
+                printf '\n实际防火墙链规则：\n'
+                iptables -S "$CHAIN" 2>/dev/null || yellow '当前还没有应用 blockip 规则。'
+                pause_menu
+                ;;
             6) uninstall_cleanup ;;
-            0) exit 0 ;;
+            7) exit 0 ;;
             *) red '无效选项。'; sleep 1 ;;
         esac
     done
