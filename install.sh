@@ -20,6 +20,7 @@ readonly UPDATE_MAX_AGE=604800
 readonly DNS_CACHE_TTL=3600
 readonly CRON_FILE="/etc/cron.d/blockip"
 readonly DNS_CACHE_DIR="${STATE_DIR}/dns-cache"
+readonly DEPENDENCY_MARKER="${STATE_DIR}/.dependencies-ok"
 
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -39,6 +40,33 @@ ensure_state() {
 }
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+ipset_persistence_ready() {
+    compgen -G '/usr/share/netfilter-persistent/plugins.d/*ipset*' >/dev/null 2>&1
+}
+
+runtime_dependencies_ready() {
+    have_cmd iptables &&
+    have_cmd iptables-save &&
+    have_cmd ipset &&
+    have_cmd netfilter-persistent &&
+    ipset_persistence_ready &&
+    { have_cmd curl || have_cmd wget; } &&
+    have_cmd getent &&
+    have_cmd awk &&
+    have_cmd sed &&
+    have_cmd grep &&
+    have_cmd nl &&
+    have_cmd wc &&
+    have_cmd mktemp &&
+    have_cmd stat &&
+    have_cmd date &&
+    have_cmd readlink &&
+    have_cmd sort &&
+    have_cmd tr &&
+    { have_cmd sha256sum || have_cmd cksum; } &&
+    { have_cmd cron || have_cmd crond; }
+}
 
 install_dependencies() {
     local packages=()
@@ -73,14 +101,26 @@ install_dependencies() {
             packages+=(ipset-persistent)
         fi
     fi
-    [ "${#packages[@]}" -gt 0 ] || return 0
+    if [ "${#packages[@]}" -eq 0 ]; then
+        runtime_dependencies_ready && { touch "$DEPENDENCY_MARKER"; return 0; }
+        die "依赖状态异常：命令或 ipset 持久化插件不可用，但未找到可补装的软件包。"
+    fi
     yellow "正在自动安装缺少的依赖：${packages[*]}"
     apt-get update || die "apt-get update 失败。"
     DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}" || \
         die "依赖安装失败。"
+    runtime_dependencies_ready || die "依赖安装完成，但仍有必要命令不可用，请检查系统软件源。"
+    touch "$DEPENDENCY_MARKER"
 }
 
 ensure_dependencies() {
+    if [ -f "$DEPENDENCY_MARKER" ] && runtime_dependencies_ready; then
+        return 0
+    fi
+    if runtime_dependencies_ready; then
+        touch "$DEPENDENCY_MARKER"
+        return 0
+    fi
     install_dependencies
 }
 
@@ -235,9 +275,24 @@ apply_rules() {
     populate_cn_set
     ensure_chain
     iptables -F "$CHAIN"
-    iptables -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
     iptables -A "$CHAIN" -i lo -j ACCEPT
     iptables -A "$CHAIN" -m set --match-set "$IPSET_WHITELIST" src -j ACCEPT
+    iptables -A "$CHAIN" -p icmp --icmp-type echo-request -m set --match-set "$IPSET_BLOCKLIST" src -j DROP
+    # Evaluate new inbound ping requests before conntrack so an already-running
+    # ping reflects a region switch immediately, while established TCP survives.
+    case "$mode" in
+        block_cn)
+            iptables -A "$CHAIN" -p icmp --icmp-type echo-request -m set --match-set "$IPSET_CN" src -j DROP
+            ;;
+        block_foreign)
+            iptables -A "$CHAIN" -p icmp --icmp-type echo-request -m set --match-set "$IPSET_CN" src -j ACCEPT
+            iptables -A "$CHAIN" -p icmp --icmp-type echo-request -j DROP
+            ;;
+        both)
+            iptables -A "$CHAIN" -p icmp --icmp-type echo-request -j DROP
+            ;;
+    esac
+    iptables -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
     iptables -A "$CHAIN" -m set --match-set "$IPSET_BLOCKLIST" src -j DROP
     case "$mode" in
         block_cn)
@@ -264,7 +319,8 @@ save_rules() {
         ipset save > /etc/iptables/ipsets || die "ipset 规则保存失败。"
     fi
     if have_cmd netfilter-persistent; then
-        netfilter-persistent save && netfilter-persistent reload || die "netfilter-persistent 保存或加载失败。"
+        netfilter-persistent save >/dev/null 2>&1 && netfilter-persistent reload >/dev/null 2>&1 || \
+            die "netfilter-persistent 保存或加载失败。"
         green "iptables/ipset 规则已持久化。"
         return 0
     fi
@@ -295,26 +351,38 @@ set_mode() {
 }
 
 toggle_region() {
-    local region=$1 enabled current next
+    local region=$1 action current next
+    action=$2
     current=$(tr -d '[:space:]' < "$MODE_FILE")
-    enabled=0
     case "$current" in
-        block_cn) [ "$region" = cn ] && enabled=1 ;;
-        block_foreign) [ "$region" = foreign ] && enabled=1 ;;
-        both) enabled=1 ;;
+        none|block_cn|block_foreign|both) ;;
+        *) current=none ;;
     esac
-    [ "$2" = on ] && enabled=1 || [ "$2" = off ] && enabled=0
     if [ "$region" = cn ]; then
-        if [ "$enabled" -eq 1 ]; then
-            case "$current" in block_foreign|both) next=both ;; *) next=block_cn ;; esac
+        if [ "$action" = on ]; then
+            case "$current" in
+                block_foreign|both) next=both ;;
+                *) next=block_cn ;;
+            esac
         else
-            [ "$current" = both ] && next=block_foreign || next=none
+            case "$current" in
+                both) next=block_foreign ;;
+                block_cn) next=none ;;
+                *) next=$current ;;
+            esac
         fi
     else
-        if [ "$enabled" -eq 1 ]; then
-            case "$current" in block_cn|both) next=both ;; *) next=block_foreign ;; esac
+        if [ "$action" = on ]; then
+            case "$current" in
+                block_cn|both) next=both ;;
+                *) next=block_foreign ;;
+            esac
         else
-            [ "$current" = both ] && next=block_cn || next=none
+            case "$current" in
+                both) next=block_cn ;;
+                block_foreign) next=none ;;
+                *) next=$current ;;
+            esac
         fi
     fi
     set_mode "$next"
@@ -489,7 +557,7 @@ uninstall_cleanup() {
         ipset destroy "$IPSET_BLOCKLIST" 2>/dev/null || true
         ipset destroy "$IPSET_CN" 2>/dev/null || true
     fi
-    rm -f "$CRON_FILE" "$MODE_FILE" "$WHITELIST_FILE" "$BLOCKLIST_FILE" "$CN_ZONE"
+    rm -f "$CRON_FILE" "$MODE_FILE" "$WHITELIST_FILE" "$BLOCKLIST_FILE" "$CN_ZONE" "$DEPENDENCY_MARKER"
     rm -f "$DNS_CACHE_DIR"/* 2>/dev/null || true
     rmdir "$DNS_CACHE_DIR" 2>/dev/null || true
     rmdir "$STATE_DIR" 2>/dev/null || true
@@ -524,8 +592,8 @@ menu() {
         printf '%s\n' '4. 手工屏蔽管理'
         printf '%s\n' '5. 查看当前规则'
         printf '%s\n' '6. 一键卸载清理'
-        printf '%s\n\n' '7. 退出'
-        read -r -p '请输入选项 [1-7]：' choice
+        printf '%s\n\n' '0. 退出'
+        read -r -p '请输入选项 [0-6]：' choice
         case "$choice" in
             1)
                 if [ "$cn_enabled" -eq 1 ]; then toggle_region cn off; else toggle_region cn on; fi
@@ -549,7 +617,7 @@ menu() {
                 pause_menu
                 ;;
             6) uninstall_cleanup ;;
-            7) exit 0 ;;
+            0) exit 0 ;;
             *) red '无效选项。'; sleep 1 ;;
         esac
     done
