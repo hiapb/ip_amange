@@ -151,12 +151,28 @@ download_cn_zone() {
     elif have_cmd wget; then
         wget -q --timeout=15 -O "$tmp" "$CN_URL"
     else
-        die "需要 curl 或 wget。"
-    fi || { rm -f "$tmp"; die "国内 IP 列表下载失败。"; }
-    [ -s "$tmp" ] || { rm -f "$tmp"; die "下载的国内 IP 列表为空。"; }
-    # Keep only valid IPv4 networks and reject a suspiciously malformed file.
-    awk 'BEGIN { ok=0 } /^[[:space:]]*[0-9]+(\.[0-9]+){3}\/[0-9]+[[:space:]]*$/ { print $1; ok++ } END { if (ok < 10) exit 1 }' "$tmp" > "${tmp}.clean" || {
-        rm -f "$tmp" "${tmp}.clean"; die "国内 IP 列表格式异常，未替换现有列表。";
+        red "需要 curl 或 wget。"
+        return 1
+    fi || { rm -f "$tmp"; red "国内 IP 列表下载失败，请检查网络后重试。"; return 1; }
+    [ -s "$tmp" ] || { rm -f "$tmp"; red "下载的国内 IP 列表为空。"; return 1; }
+    # Portable validation for mawk/busybox awk; do not rely on {n} regex intervals.
+    awk '
+        function valid_cidr(value, parts, ip, octets, i) {
+            parts = split(value, cidr, "/")
+            if (parts != 2 || cidr[2] !~ /^[0-9]+$/ || cidr[2] < 0 || cidr[2] > 32) return 0
+            ip = split(cidr[1], octets, ".")
+            if (ip != 4) return 0
+            for (i = 1; i <= 4; i++) {
+                if (octets[i] !~ /^[0-9]+$/ || octets[i] < 0 || octets[i] > 255) return 0
+            }
+            return 1
+        }
+        NF == 1 && valid_cidr($1) { print $1; ok++ }
+        END { if (ok < 10) exit 1 }
+    ' "$tmp" > "${tmp}.clean" || {
+        rm -f "$tmp" "${tmp}.clean"
+        red "国内 IP 列表格式异常，未修改现有规则。"
+        return 1
     }
     mv "${tmp}.clean" "$CN_ZONE"
     rm -f "$tmp"
@@ -166,13 +182,13 @@ download_cn_zone() {
 
 ensure_cn_zone() {
     local now modified age
-    [ -s "$CN_ZONE" ] || { download_cn_zone; return; }
+    [ -s "$CN_ZONE" ] || { download_cn_zone; return $?; }
     modified=$(stat -c %Y "$CN_ZONE" 2>/dev/null || printf 0)
     now=$(date +%s)
     age=$((now - modified))
     if [ "$age" -ge "$UPDATE_MAX_AGE" ]; then
         yellow "国内 IP 列表已超过 7 天，正在自动更新。"
-        if ! (download_cn_zone); then
+        if ! download_cn_zone; then
             yellow "更新失败，继续使用已有列表。"
         fi
     fi
@@ -265,7 +281,10 @@ apply_rules() {
     local mode
     mode=$(tr -d '[:space:]' < "$MODE_FILE")
     case "$mode" in
-        block_cn|block_foreign) ensure_cn_zone; install_update_schedule ;;
+        block_cn|block_foreign)
+            ensure_cn_zone || return 1
+            install_update_schedule
+            ;;
     esac
     create_set "$IPSET_WHITELIST"
     create_set "$IPSET_BLOCKLIST"
@@ -330,8 +349,7 @@ save_rules() {
 }
 
 apply_and_save() {
-    apply_rules
-    save_rules
+    apply_rules && save_rules
 }
 
 mode_label() {
@@ -344,10 +362,15 @@ mode_label() {
 }
 
 set_mode() {
-    local mode=$1
+    local mode=$1 previous
     ensure_state
+    previous=$(tr -d '[:space:]' < "$MODE_FILE")
     printf '%s\n' "$mode" > "$MODE_FILE"
-    apply_and_save
+    if ! apply_and_save; then
+        printf '%s\n' "$previous" > "$MODE_FILE"
+        red "操作失败，已恢复之前的开关状态。"
+        return 1
+    fi
 }
 
 toggle_region() {
@@ -544,8 +567,8 @@ uninstall_cleanup() {
     screen_title '一键卸载清理'
     printf '%s\n' '此操作会删除 blockip 创建的防火墙链、ipset、定时任务和配置。'
     printf '不会卸载系统的 iptables/ipset 软件包，也不会修改其他防火墙链。\n'
-    read -r -p '确认卸载清理？请输入 REMOVE：' confirm
-    [ "$confirm" = REMOVE ] || { yellow '已取消。'; pause_menu; return; }
+    read -r -p '确认卸载清理？[y/N]：' confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || { yellow '已取消卸载。'; pause_menu; return; }
 
     if have_cmd iptables; then
         while iptables -C INPUT -j "$CHAIN" 2>/dev/null; do iptables -D INPUT -j "$CHAIN"; done
@@ -607,8 +630,8 @@ menu() {
                     [[ -z "$confirm" || "$confirm" =~ ^[Yy]$ ]] && toggle_region foreign on
                 fi
                 ;;
-            3) manage_entries "$WHITELIST_FILE" '白名单（允许列表）' ;;
-            4) manage_entries "$BLOCKLIST_FILE" '手工屏蔽（拒绝列表）' ;;
+            3) manage_entries "$WHITELIST_FILE" '白名单' ;;
+            4) manage_entries "$BLOCKLIST_FILE" '手工屏蔽' ;;
             5)
                 screen_title '当前规则'
                 show_status
