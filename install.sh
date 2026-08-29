@@ -6,6 +6,7 @@ set -u
 
 readonly APP_NAME="blockip"
 readonly CHAIN="BLOCKIP_INPUT"
+readonly BIN_PATH="/usr/local/sbin/blockip"
 readonly STATE_DIR="/etc/blockip"
 readonly CN_ZONE="${STATE_DIR}/cn.zone"
 readonly MODE_FILE="${STATE_DIR}/mode"
@@ -17,9 +18,11 @@ readonly IPSET_CN="blockip_cn"
 readonly UPDATE_MAX_AGE=604800
 # Domain records are refreshed at most once per hour when rules are applied.
 readonly DNS_CACHE_TTL=3600
-readonly CRON_FILE="/etc/cron.d/blockip"
 readonly DNS_CACHE_DIR="${STATE_DIR}/dns-cache"
 readonly DEPENDENCY_MARKER="${STATE_DIR}/.dependencies-ok"
+readonly SERVICE_FILE="/etc/systemd/system/blockip.service"
+readonly REFRESH_SERVICE_FILE="/etc/systemd/system/blockip-refresh.service"
+readonly TIMER_FILE="/etc/systemd/system/blockip-refresh.timer"
 
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -40,16 +43,10 @@ ensure_state() {
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-ipset_persistence_ready() {
-    compgen -G '/usr/share/netfilter-persistent/plugins.d/*ipset*' >/dev/null 2>&1
-}
-
 runtime_dependencies_ready() {
     have_cmd iptables &&
-    have_cmd iptables-save &&
     have_cmd ipset &&
-    have_cmd netfilter-persistent &&
-    ipset_persistence_ready &&
+    have_cmd systemctl &&
     { have_cmd curl || have_cmd wget; } &&
     have_cmd getent &&
     have_cmd awk &&
@@ -63,19 +60,19 @@ runtime_dependencies_ready() {
     have_cmd readlink &&
     have_cmd sort &&
     have_cmd tr &&
-    { have_cmd sha256sum || have_cmd cksum; } &&
-    { have_cmd cron || have_cmd crond; }
+    have_cmd install &&
+    have_cmd cmp &&
+    have_cmd flock &&
+    { have_cmd sha256sum || have_cmd cksum; }
 }
 
 install_dependencies() {
-    local packages=()
+    local packages=() unique_packages=() package
     require_root
     have_cmd apt-get || die "未找到 apt-get，请手动安装 iptables 和 ipset。"
     have_cmd iptables || packages+=(iptables)
-    have_cmd iptables-save || packages+=(iptables)
     have_cmd ipset || packages+=(ipset)
-    have_cmd netfilter-persistent || packages+=(iptables-persistent)
-    have_cmd cron || have_cmd crond || packages+=(cron)
+    have_cmd systemctl || packages+=(systemd)
     have_cmd curl || have_cmd wget || packages+=(wget)
     have_cmd getent || packages+=(libc-bin)
     have_cmd clear || packages+=(ncurses-bin)
@@ -90,19 +87,20 @@ install_dependencies() {
     have_cmd readlink || packages+=(coreutils)
     have_cmd sort || packages+=(coreutils)
     have_cmd tr || packages+=(coreutils)
+    have_cmd install || packages+=(coreutils)
+    have_cmd cmp || packages+=(diffutils)
+    have_cmd flock || packages+=(util-linux)
     have_cmd sha256sum || have_cmd cksum || packages+=(coreutils)
     if have_cmd dpkg-query && ! dpkg-query -W -f='${Status}' ca-certificates 2>/dev/null | grep -q 'install ok installed'; then
         packages+=(ca-certificates)
     fi
-    # ipset-persistent is a plugin, so it does not provide a command to test.
-    if have_cmd dpkg-query && ! dpkg-query -W -f='${Status}' ipset-persistent 2>/dev/null | grep -q 'install ok installed'; then
-        if ! have_cmd apt-cache || apt-cache show ipset-persistent >/dev/null 2>&1; then
-            packages+=(ipset-persistent)
-        fi
-    fi
+    for package in "${packages[@]}"; do
+        [[ " ${unique_packages[*]} " == *" $package "* ]] || unique_packages+=("$package")
+    done
+    packages=("${unique_packages[@]}")
     if [ "${#packages[@]}" -eq 0 ]; then
         runtime_dependencies_ready && { touch "$DEPENDENCY_MARKER"; return 0; }
-        die "依赖状态异常：命令或 ipset 持久化插件不可用，但未找到可补装的软件包。"
+        die "依赖状态异常：必要命令不可用，但未找到可补装的软件包。"
     fi
     yellow "正在自动安装缺少的依赖：${packages[*]}"
     apt-get update || die "apt-get update 失败。"
@@ -207,28 +205,78 @@ ensure_cn_zone() {
     fi
 }
 
-install_update_schedule() {
-    local script_path
-    have_cmd readlink || return 0
-    script_path=$(readlink -f "$0" 2>/dev/null || true)
-    [ -n "$script_path" ] || return 0
-    mkdir -p /etc/cron.d
-    printf '# Managed by blockip.sh\n17 4 * * 1 root %s --refresh >/dev/null 2>&1\n' "$script_path" > "$CRON_FILE"
-    chmod 644 "$CRON_FILE"
-    if have_cmd systemctl; then
-        systemctl enable --now cron >/dev/null 2>&1 || systemctl enable --now crond >/dev/null 2>&1 || true
-    elif have_cmd service; then
-        service cron start >/dev/null 2>&1 || service crond start >/dev/null 2>&1 || true
+install_self() {
+    local source_path resolved_path
+    source_path=${BASH_SOURCE[0]}
+    resolved_path=$(readlink -f "$source_path" 2>/dev/null || printf '%s' "$source_path")
+    if [ "$resolved_path" != "$BIN_PATH" ]; then
+        # Keep the original /dev/fd path readable while running via bash <(curl ...).
+        install -m 755 "$source_path" "$BIN_PATH" || die "无法安装到 $BIN_PATH"
+        green "程序已安装/更新：$BIN_PATH"
+        green "以后直接运行：blockip"
+        exec "$BIN_PATH" "$@"
     fi
+}
+
+install_systemd_units() {
+    local changed=0 tmp
+    tmp=$(mktemp)
+    printf '%s\n' \
+        '[Unit]' \
+        'Description=blockip inbound firewall' \
+        'After=network-online.target' \
+        'Wants=network-online.target' \
+        '' \
+        '[Service]' \
+        'Type=oneshot' \
+        "ExecStart=$BIN_PATH --apply" \
+        'RemainAfterExit=yes' \
+        '' \
+        '[Install]' \
+        'WantedBy=multi-user.target' > "$tmp"
+    cmp -s "$tmp" "$SERVICE_FILE" 2>/dev/null || { install -m 644 "$tmp" "$SERVICE_FILE"; changed=1; }
+
+    printf '%s\n' \
+        '[Unit]' \
+        'Description=Refresh blockip country and domain data' \
+        'After=network-online.target' \
+        'Wants=network-online.target' \
+        '' \
+        '[Service]' \
+        'Type=oneshot' \
+        "ExecStart=$BIN_PATH --maintenance" > "$tmp"
+    cmp -s "$tmp" "$REFRESH_SERVICE_FILE" 2>/dev/null || { install -m 644 "$tmp" "$REFRESH_SERVICE_FILE"; changed=1; }
+
+    printf '%s\n' \
+        '[Unit]' \
+        'Description=Run blockip maintenance hourly' \
+        '' \
+        '[Timer]' \
+        'OnBootSec=10min' \
+        'OnUnitActiveSec=1h' \
+        'Persistent=true' \
+        'RandomizedDelaySec=5min' \
+        '' \
+        '[Install]' \
+        'WantedBy=timers.target' > "$tmp"
+    cmp -s "$tmp" "$TIMER_FILE" 2>/dev/null || { install -m 644 "$tmp" "$TIMER_FILE"; changed=1; }
+    rm -f "$tmp"
+    rm -f /etc/cron.d/blockip
+    [ "$changed" -eq 0 ] || systemctl daemon-reload
+    systemctl enable blockip.service blockip-refresh.timer >/dev/null 2>&1 || { red "systemd 服务启用失败。"; return 1; }
+    systemctl start blockip-refresh.timer >/dev/null 2>&1 || { red "systemd 定时器启动失败。"; return 1; }
 }
 
 create_set() {
     local name=$1
-    ipset create "$name" hash:net family inet hashsize 4096 maxelem 1048576 -exist
+    ipset create "$name" hash:net family inet hashsize 4096 maxelem 1048576 -exist || {
+        red "无法创建 ipset：$name"
+        return 1
+    }
 }
 
 resolve_domain() {
-    local domain=$1 ip now modified age cache_file cache_key ips
+    local domain=$1 ip now modified age cache_file cache_key ips tmp
     have_cmd getent || return 0
     mkdir -p "$DNS_CACHE_DIR"
     if have_cmd sha256sum; then
@@ -247,47 +295,68 @@ resolve_domain() {
         fi
     fi
     ips=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u)
-    : > "$cache_file"
+    tmp="${cache_file}.tmp"
+    : > "$tmp"
     while read -r ip; do
-        valid_ipv4_or_cidr "$ip" && printf '%s\n' "$ip" >> "$cache_file"
+        valid_ipv4_or_cidr "$ip" && printf '%s\n' "$ip" >> "$tmp"
     done <<< "$ips"
-    cat "$cache_file"
+    if [ -s "$tmp" ]; then
+        mv "$tmp" "$cache_file"
+    else
+        rm -f "$tmp"
+    fi
+    [ -s "$cache_file" ] && cat "$cache_file"
 }
 
 populate_set_from_file() {
     local set_name=$1 file=$2 line kind value ip
-    ipset flush "$set_name"
+    ipset flush "$set_name" || return 1
     while IFS='|' read -r kind value; do
         [ -n "${kind:-}" ] || continue
         [[ "$kind" == \#* ]] && continue
         value=${value%%[[:space:]]*}
         case "$kind" in
             IP|NET)
-                valid_ipv4_or_cidr "$value" && ipset add "$set_name" "$value" -exist
+                if valid_ipv4_or_cidr "$value"; then
+                    ipset add "$set_name" "$value" -exist || return 1
+                fi
                 ;;
             DOMAIN)
-                while read -r ip; do ipset add "$set_name" "$ip" -exist; done < <(resolve_domain "$value")
+                while read -r ip; do
+                    ipset add "$set_name" "$ip" -exist || return 1
+                done < <(resolve_domain "$value")
                 ;;
         esac
     done < "$file"
 }
 
 populate_cn_set() {
-    ipset flush "$IPSET_CN"
+    ipset flush "$IPSET_CN" || return 1
     [ -s "$CN_ZONE" ] || return 0
     while read -r network; do
-        valid_ipv4_or_cidr "$network" && ipset add "$IPSET_CN" "$network" -exist
+        if valid_ipv4_or_cidr "$network"; then
+            ipset add "$IPSET_CN" "$network" -exist || return 1
+        fi
     done < "$CN_ZONE"
 }
 
 ensure_chain() {
     iptables -N "$CHAIN" 2>/dev/null || true
     # Remove duplicate jumps, then put exactly one jump at INPUT's head.
-    while iptables -C INPUT -j "$CHAIN" 2>/dev/null; do iptables -D INPUT -j "$CHAIN"; done
-    iptables -I INPUT 1 -j "$CHAIN"
+    while iptables -C INPUT -j "$CHAIN" 2>/dev/null; do
+        iptables -D INPUT -j "$CHAIN" || return 1
+    done
+    iptables -I INPUT 1 -j "$CHAIN" || return 1
 }
 
-apply_rules() {
+append_rule() {
+    iptables -A "$CHAIN" "$@" || {
+        red "iptables 规则写入失败。"
+        return 1
+    }
+}
+
+apply_rules_unlocked() {
     require_root
     ensure_dependencies
     ensure_state
@@ -296,47 +365,46 @@ apply_rules() {
     case "$mode" in
         block_cn|block_foreign)
             ensure_cn_zone || return 1
-            install_update_schedule
             ;;
     esac
-    create_set "$IPSET_WHITELIST"
-    create_set "$IPSET_BLOCKLIST"
-    create_set "$IPSET_CN"
-    populate_set_from_file "$IPSET_WHITELIST" "$WHITELIST_FILE"
-    populate_set_from_file "$IPSET_BLOCKLIST" "$BLOCKLIST_FILE"
-    populate_cn_set
-    ensure_chain
-    iptables -F "$CHAIN"
-    iptables -A "$CHAIN" -i lo -j ACCEPT
-    iptables -A "$CHAIN" -m set --match-set "$IPSET_WHITELIST" src -j ACCEPT
-    iptables -A "$CHAIN" -p icmp --icmp-type echo-request -m set --match-set "$IPSET_BLOCKLIST" src -j DROP
+    create_set "$IPSET_WHITELIST" || return 1
+    create_set "$IPSET_BLOCKLIST" || return 1
+    create_set "$IPSET_CN" || return 1
+    populate_set_from_file "$IPSET_WHITELIST" "$WHITELIST_FILE" || return 1
+    populate_set_from_file "$IPSET_BLOCKLIST" "$BLOCKLIST_FILE" || return 1
+    populate_cn_set || return 1
+    ensure_chain || return 1
+    iptables -F "$CHAIN" || return 1
+    append_rule -i lo -j ACCEPT || return 1
+    append_rule -m set --match-set "$IPSET_WHITELIST" src -j ACCEPT || return 1
+    append_rule -p icmp --icmp-type echo-request -m set --match-set "$IPSET_BLOCKLIST" src -j DROP || return 1
     # Evaluate new inbound ping requests before conntrack so an already-running
     # ping reflects a region switch immediately, while established TCP survives.
     case "$mode" in
         block_cn)
-            iptables -A "$CHAIN" -p icmp --icmp-type echo-request -m set --match-set "$IPSET_CN" src -j DROP
+            append_rule -p icmp --icmp-type echo-request -m set --match-set "$IPSET_CN" src -j DROP || return 1
             ;;
         block_foreign)
-            iptables -A "$CHAIN" -p icmp --icmp-type echo-request -m set --match-set "$IPSET_CN" src -j ACCEPT
-            iptables -A "$CHAIN" -p icmp --icmp-type echo-request -j DROP
+            append_rule -p icmp --icmp-type echo-request -m set --match-set "$IPSET_CN" src -j ACCEPT || return 1
+            append_rule -p icmp --icmp-type echo-request -j DROP || return 1
             ;;
         both)
-            iptables -A "$CHAIN" -p icmp --icmp-type echo-request -j DROP
+            append_rule -p icmp --icmp-type echo-request -j DROP || return 1
             ;;
     esac
-    iptables -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-    iptables -A "$CHAIN" -m set --match-set "$IPSET_BLOCKLIST" src -j DROP
+    append_rule -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || return 1
+    append_rule -m set --match-set "$IPSET_BLOCKLIST" src -j DROP || return 1
     case "$mode" in
         block_cn)
-            iptables -A "$CHAIN" -m set --match-set "$IPSET_CN" src -j DROP
+            append_rule -m set --match-set "$IPSET_CN" src -j DROP || return 1
             ;;
         block_foreign)
-            iptables -A "$CHAIN" -m set --match-set "$IPSET_CN" src -j ACCEPT
-            iptables -A "$CHAIN" -j DROP
+            append_rule -m set --match-set "$IPSET_CN" src -j ACCEPT || return 1
+            append_rule -j DROP || return 1
             ;;
         both)
             # In both mode only the established/local/whitelisted sources survive.
-            iptables -A "$CHAIN" -j DROP
+            append_rule -j DROP || return 1
             ;;
         none|*)
             ;;
@@ -344,25 +412,18 @@ apply_rules() {
     green "规则已应用，当前模式：$(mode_label "$mode")"
 }
 
-save_rules() {
-    require_root
-    mkdir -p /etc/iptables
-    if have_cmd ipset; then
-        ipset save > /etc/iptables/ipsets || die "ipset 规则保存失败。"
-    fi
-    if have_cmd netfilter-persistent; then
-        netfilter-persistent save >/dev/null 2>&1 && netfilter-persistent reload >/dev/null 2>&1 || \
-            die "netfilter-persistent 保存或加载失败。"
-        green "iptables/ipset 规则已持久化。"
-        return 0
-    fi
-    have_cmd iptables-save || die "未找到 iptables-save。"
-    iptables-save > /etc/iptables/rules.v4 || die "规则保存失败。"
-    green "iptables 规则已保存到 /etc/iptables/rules.v4（请安装 ipset-persistent 以恢复 ipset）。"
+apply_rules() {
+    mkdir -p /run/lock
+    (
+        flock -x 9
+        apply_rules_unlocked
+    ) 9>/run/lock/blockip.lock
 }
 
 apply_and_save() {
-    apply_rules && save_rules
+    apply_rules || return 1
+    install_systemd_units || return 1
+    green "开机恢复和自动维护已启用。"
 }
 
 mode_label() {
@@ -381,6 +442,7 @@ set_mode() {
     printf '%s\n' "$mode" > "$MODE_FILE"
     if ! apply_and_save; then
         printf '%s\n' "$previous" > "$MODE_FILE"
+        apply_rules >/dev/null 2>&1 || true
         red "操作失败，已恢复之前的开关状态。"
         return 1
     fi
@@ -583,6 +645,10 @@ uninstall_cleanup() {
     read -r -p '确认卸载清理？[y/N]：' confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || { yellow '已取消卸载。'; pause_menu; return; }
 
+    systemctl disable --now blockip-refresh.timer blockip.service >/dev/null 2>&1 || true
+    rm -f "$SERVICE_FILE" "$REFRESH_SERVICE_FILE" "$TIMER_FILE"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed >/dev/null 2>&1 || true
     if have_cmd iptables; then
         while iptables -C INPUT -j "$CHAIN" 2>/dev/null; do iptables -D INPUT -j "$CHAIN"; done
         iptables -F "$CHAIN" 2>/dev/null || true
@@ -593,25 +659,19 @@ uninstall_cleanup() {
         ipset destroy "$IPSET_BLOCKLIST" 2>/dev/null || true
         ipset destroy "$IPSET_CN" 2>/dev/null || true
     fi
-    rm -f "$CRON_FILE" "$MODE_FILE" "$WHITELIST_FILE" "$BLOCKLIST_FILE" "$CN_ZONE" "$DEPENDENCY_MARKER"
+    rm -f /etc/cron.d/blockip "$MODE_FILE" "$WHITELIST_FILE" "$BLOCKLIST_FILE" "$CN_ZONE" "$DEPENDENCY_MARKER"
     rm -f "$DNS_CACHE_DIR"/* 2>/dev/null || true
     rmdir "$DNS_CACHE_DIR" 2>/dev/null || true
     rmdir "$STATE_DIR" 2>/dev/null || true
-    if have_cmd netfilter-persistent; then
-        netfilter-persistent save >/dev/null 2>&1 || true
-        netfilter-persistent reload >/dev/null 2>&1 || true
-    elif have_cmd iptables-save; then
-        mkdir -p /etc/iptables
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-    fi
-    green 'blockip 规则、配置和自动更新任务已清理。'
+    rm -f "$BIN_PATH"
+    green 'blockip 程序、规则、配置和 systemd 自动任务已清理。'
     exit 0
 }
 
 menu() {
     local mode cn_enabled foreign_enabled cn_action foreign_action choice confirm
     while true; do
-        screen_title 'blockip 防火墙管理'
+        screen_title 'BlockIP 防火墙管理'
         mode=$(tr -d '[:space:]' < "$MODE_FILE")
         cn_enabled=0
         foreign_enabled=0
@@ -665,18 +725,24 @@ main() {
     if [ "$(id -u)" -ne 0 ]; then
         exec sudo -E bash "$0" "$@"
     fi
+    install_self "$@"
     ensure_state
     ensure_dependencies
     case "${1:-}" in
-        --refresh)
+        --apply)
+            apply_rules
+            exit $?
+            ;;
+        --maintenance)
             mode=$(tr -d '[:space:]' < "$MODE_FILE")
             case "$mode" in
-                block_cn|block_foreign) download_cn_zone; apply_and_save ;;
-                *) exit 0 ;;
+                block_cn|block_foreign) ensure_cn_zone || exit 1 ;;
             esac
-            exit 0
+            apply_rules
+            exit $?
             ;;
     esac
+    install_systemd_units || die "自动恢复服务安装失败。"
     menu
 }
 
