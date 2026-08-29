@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # blockip.sh - IPv4 country/manual firewall manager for Debian/Ubuntu.
-# The script owns only the BLOCKIP_INPUT chain and its ipsets.
+# The script owns only the BLOCKIP_INPUT iptables chain.
 
 set -u
 
 readonly APP_NAME="blockip"
+readonly VERSION="2.1.0"
 readonly CHAIN="BLOCKIP_INPUT"
+readonly STAGING_CHAIN="BLOCKIP_STAGE"
 readonly BIN_PATH="/usr/local/sbin/blockip"
 readonly SCRIPT_URL="https://raw.githubusercontent.com/hiapb/ip_amange/main/install.sh"
 readonly STATE_DIR="/etc/blockip"
@@ -13,9 +15,6 @@ readonly CN_ZONE="${STATE_DIR}/cn.zone"
 readonly MODE_FILE="${STATE_DIR}/mode"
 readonly WHITELIST_FILE="${STATE_DIR}/whitelist.conf"
 readonly BLOCKLIST_FILE="${STATE_DIR}/blocklist.conf"
-readonly IPSET_WHITELIST="blockip_whitelist"
-readonly IPSET_BLOCKLIST="blockip_blocklist"
-readonly IPSET_CN="blockip_cn"
 readonly UPDATE_MAX_AGE=604800
 # Domain records are refreshed at most once per hour when rules are applied.
 readonly DNS_CACHE_TTL=3600
@@ -25,9 +24,20 @@ readonly SERVICE_FILE="/etc/systemd/system/blockip.service"
 readonly REFRESH_SERVICE_FILE="/etc/systemd/system/blockip-refresh.service"
 readonly TIMER_FILE="/etc/systemd/system/blockip-refresh.timer"
 
-red() { printf '\033[31m%s\033[0m\n' "$*"; }
-green() { printf '\033[32m%s\033[0m\n' "$*"; }
-yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    readonly C_RED=$'\033[31m'
+    readonly C_GREEN=$'\033[32m'
+    readonly C_YELLOW=$'\033[33m'
+    readonly C_CYAN=$'\033[36m'
+    readonly C_BOLD=$'\033[1m'
+    readonly C_RESET=$'\033[0m'
+else
+    readonly C_RED='' C_GREEN='' C_YELLOW='' C_CYAN='' C_BOLD='' C_RESET=''
+fi
+
+red() { printf '%s%s%s\n' "$C_RED" "$*" "$C_RESET"; }
+green() { printf '%s%s%s\n' "$C_GREEN" "$*" "$C_RESET"; }
+yellow() { printf '%s%s%s\n' "$C_YELLOW" "$*" "$C_RESET"; }
 die() { red "$*"; exit 1; }
 
 require_root() {
@@ -44,10 +54,13 @@ ensure_state() {
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+ipt() {
+    iptables -w 10 "$@"
+}
+
 runtime_dependencies_ready() {
     have_cmd iptables &&
-    have_cmd ipset &&
-    have_cmd systemctl &&
+    have_cmd iptables-restore &&
     { have_cmd curl || have_cmd wget; } &&
     have_cmd getent &&
     have_cmd awk &&
@@ -62,6 +75,7 @@ runtime_dependencies_ready() {
     have_cmd sort &&
     have_cmd tr &&
     have_cmd install &&
+    have_cmd cp &&
     have_cmd cmp &&
     have_cmd flock &&
     { have_cmd sha256sum || have_cmd cksum; }
@@ -70,10 +84,9 @@ runtime_dependencies_ready() {
 install_dependencies() {
     local packages=() unique_packages=() package
     require_root
-    have_cmd apt-get || die "未找到 apt-get，请手动安装 iptables 和 ipset。"
+    have_cmd apt-get || die "未找到 apt-get，请手动安装 iptables。"
     have_cmd iptables || packages+=(iptables)
-    have_cmd ipset || packages+=(ipset)
-    have_cmd systemctl || packages+=(systemd)
+    have_cmd iptables-restore || packages+=(iptables)
     have_cmd curl || have_cmd wget || packages+=(wget)
     have_cmd getent || packages+=(libc-bin)
     have_cmd clear || packages+=(ncurses-bin)
@@ -89,6 +102,7 @@ install_dependencies() {
     have_cmd sort || packages+=(coreutils)
     have_cmd tr || packages+=(coreutils)
     have_cmd install || packages+=(coreutils)
+    have_cmd cp || packages+=(coreutils)
     have_cmd cmp || packages+=(diffutils)
     have_cmd flock || packages+=(util-linux)
     have_cmd sha256sum || have_cmd cksum || packages+=(coreutils)
@@ -136,6 +150,14 @@ valid_ipv4_or_cidr() {
     fi
 }
 
+valid_ipv4() {
+    [[ "$1" != */* ]] && valid_ipv4_or_cidr "$1"
+}
+
+valid_cidr() {
+    [[ "$1" == */* ]] && valid_ipv4_or_cidr "$1"
+}
+
 valid_domain() {
     [[ "$1" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]
 }
@@ -154,8 +176,11 @@ validate_cn_zone_file() {
             }
             return 1
         }
+        {
+            sub(/\r$/, "", $1)
+        }
         NF == 1 && valid_cidr($1) { print $1; ok++ }
-        END { if (ok < 10) exit 1 }
+        END { if (ok < 100) exit 1 }
     ' "$input" > "$output"
 }
 
@@ -207,7 +232,7 @@ ensure_cn_zone() {
 }
 
 install_self() {
-    local source_path resolved_path install_source tmp=''
+    local source_path resolved_path install_source tmp='' target_tmp
     source_path=${BASH_SOURCE[0]}
     resolved_path=$(readlink -f "$source_path" 2>/dev/null || printf '%s' "$source_path")
     if [ "$resolved_path" != "$BIN_PATH" ]; then
@@ -234,20 +259,26 @@ install_self() {
                 install_source=$tmp
                 ;;
         esac
-        install -m 755 "$install_source" "$BIN_PATH" || {
+        target_tmp="${BIN_PATH}.new.$$"
+        install -m 755 "$install_source" "$target_tmp" || {
             [ -n "$tmp" ] && rm -f "$tmp"
             die "无法安装到 $BIN_PATH"
         }
         [ -n "$tmp" ] && rm -f "$tmp"
-        bash -n "$BIN_PATH" || { rm -f "$BIN_PATH"; die "安装后的脚本校验失败。"; }
+        bash -n "$target_tmp" || { rm -f "$target_tmp"; die "下载的程序校验失败，原版本未被修改。"; }
+        mv -f "$target_tmp" "$BIN_PATH" || { rm -f "$target_tmp"; die "无法更新 $BIN_PATH"; }
         green "程序已安装/更新：$BIN_PATH"
         green "以后直接运行：blockip"
-        exec "$BIN_PATH" "$@"
+        exec bash "$BIN_PATH" "$@"
     fi
 }
 
 install_systemd_units() {
     local changed=0 tmp
+    PERSISTENCE_ENABLED=0
+    if ! have_cmd systemctl || [ ! -d /run/systemd/system ]; then
+        return 0
+    fi
     tmp=$(mktemp)
     printf '%s\n' \
         '[Unit]' \
@@ -293,14 +324,46 @@ install_systemd_units() {
     [ "$changed" -eq 0 ] || systemctl daemon-reload
     systemctl enable blockip.service blockip-refresh.timer >/dev/null 2>&1 || { red "systemd 服务启用失败。"; return 1; }
     systemctl start blockip-refresh.timer >/dev/null 2>&1 || { red "systemd 定时器启动失败。"; return 1; }
+    PERSISTENCE_ENABLED=1
 }
 
-create_set() {
-    local name=$1
-    ipset create "$name" hash:net family inet hashsize 4096 maxelem 1048576 -exist || {
-        red "无法创建 ipset：$name"
+check_firewall_access() {
+    if ! ipt -L INPUT -n >/dev/null 2>&1; then
+        red '当前系统无法操作 iptables。'
+        red '如果这是 Docker/LXC 容器，需要宿主机授予 NET_ADMIN 权限；普通容器内无法管理入口防火墙。'
         return 1
-    }
+    fi
+}
+
+append_sources_from_file() {
+    local file=$1 target=$2 kind value ip
+    shift 2
+    while IFS='|' read -r kind value; do
+        [ -n "${kind:-}" ] || continue
+        case "$kind" in
+            IP|NET)
+                if valid_ipv4_or_cidr "$value"; then
+                    append_rule "$@" -s "$value" -j "$target" || return 1
+                fi
+                ;;
+            DOMAIN)
+                while read -r ip; do
+                    append_rule "$@" -s "$ip" -j "$target" || return 1
+                done < <(resolve_domain "$value")
+                ;;
+        esac
+    done < "$file"
+}
+
+append_cn_sources() {
+    local target=$1 network
+    shift
+    [ -s "$CN_ZONE" ] || return 0
+    while read -r network; do
+        if valid_ipv4_or_cidr "$network"; then
+            append_rule "$@" -s "$network" -j "$target" || return 1
+        fi
+    done < "$CN_ZONE"
 }
 
 resolve_domain() {
@@ -336,58 +399,83 @@ resolve_domain() {
     [ -s "$cache_file" ] && cat "$cache_file"
 }
 
-populate_set_from_file() {
-    local set_name=$1 file=$2 line kind value ip
-    ipset flush "$set_name" || return 1
-    while IFS='|' read -r kind value; do
-        [ -n "${kind:-}" ] || continue
-        [[ "$kind" == \#* ]] && continue
-        value=${value%%[[:space:]]*}
-        case "$kind" in
-            IP|NET)
-                if valid_ipv4_or_cidr "$value"; then
-                    ipset add "$set_name" "$value" -exist || return 1
-                fi
-                ;;
-            DOMAIN)
-                while read -r ip; do
-                    ipset add "$set_name" "$ip" -exist || return 1
-                done < <(resolve_domain "$value")
-                ;;
-        esac
-    done < "$file"
-}
-
-populate_cn_set() {
-    ipset flush "$IPSET_CN" || return 1
-    [ -s "$CN_ZONE" ] || return 0
-    while read -r network; do
-        if valid_ipv4_or_cidr "$network"; then
-            ipset add "$IPSET_CN" "$network" -exist || return 1
-        fi
-    done < "$CN_ZONE"
-}
-
-ensure_chain() {
-    iptables -N "$CHAIN" 2>/dev/null || true
-    # Remove duplicate jumps, then put exactly one jump at INPUT's head.
-    while iptables -C INPUT -j "$CHAIN" 2>/dev/null; do
-        iptables -D INPUT -j "$CHAIN" || return 1
+remove_chain() {
+    local name=$1
+    while ipt -C INPUT -j "$name" 2>/dev/null; do
+        ipt -D INPUT -j "$name" || return 1
     done
-    iptables -I INPUT 1 -j "$CHAIN" || return 1
+    if ipt -S "$name" >/dev/null 2>&1; then
+        ipt -F "$name" || return 1
+        ipt -X "$name" || return 1
+    fi
+}
+
+prepare_staging_chain() {
+    remove_chain "$STAGING_CHAIN" || return 1
+    RULES_FILE=$(mktemp) || return 1
+    printf '*filter\n:%s - [0:0]\n' "$STAGING_CHAIN" > "$RULES_FILE" || {
+        rm -f "$RULES_FILE"
+        unset RULES_FILE
+        return 1
+    }
+    BUILD_CHAIN=$STAGING_CHAIN
+}
+
+discard_staging_rules() {
+    if [ -n "${RULES_FILE:-}" ]; then
+        rm -f "$RULES_FILE"
+        unset RULES_FILE
+    fi
+}
+
+commit_staging_rules() {
+    [ -n "${RULES_FILE:-}" ] || return 1
+    printf 'COMMIT\n' >> "$RULES_FILE" || { discard_staging_rules; return 1; }
+    if ! iptables-restore -w 10 --noflush < "$RULES_FILE"; then
+        red "iptables 批量提交失败，未替换原有规则。"
+        discard_staging_rules
+        remove_chain "$STAGING_CHAIN" >/dev/null 2>&1 || true
+        return 1
+    fi
+    discard_staging_rules
+}
+
+activate_staging_chain() {
+    ipt -I INPUT 1 -j "$STAGING_CHAIN" || return 1
+    while ipt -C INPUT -j "$CHAIN" 2>/dev/null; do
+        ipt -D INPUT -j "$CHAIN" || return 1
+    done
+    if ipt -S "$CHAIN" >/dev/null 2>&1; then
+        ipt -F "$CHAIN" || return 1
+        ipt -X "$CHAIN" || return 1
+    fi
+    ipt -E "$STAGING_CHAIN" "$CHAIN" || return 1
+    BUILD_CHAIN=$CHAIN
+    ipt -C INPUT -j "$CHAIN" >/dev/null 2>&1 || return 1
+    ipt -S "$CHAIN" >/dev/null 2>&1 || return 1
 }
 
 append_rule() {
-    iptables -A "$CHAIN" "$@" || {
-        red "iptables 规则写入失败。"
-        return 1
-    }
+    local argument
+    if [ -n "${RULES_FILE:-}" ]; then
+        printf -- '-A %s' "${BUILD_CHAIN:-$CHAIN}" >> "$RULES_FILE" || return 1
+        for argument in "$@"; do
+            printf ' %s' "$argument" >> "$RULES_FILE" || return 1
+        done
+        printf '\n' >> "$RULES_FILE" || return 1
+    else
+        ipt -A "${BUILD_CHAIN:-$CHAIN}" "$@" || {
+            red "iptables 规则写入失败。"
+            return 1
+        }
+    fi
 }
 
 apply_rules_unlocked() {
     require_root
     ensure_dependencies
     ensure_state
+    check_firewall_access || return 1
     local mode
     mode=$(tr -d '[:space:]' < "$MODE_FILE")
     case "$mode" in
@@ -395,49 +483,51 @@ apply_rules_unlocked() {
             ensure_cn_zone || return 1
             ;;
     esac
-    create_set "$IPSET_WHITELIST" || return 1
-    create_set "$IPSET_BLOCKLIST" || return 1
-    create_set "$IPSET_CN" || return 1
-    populate_set_from_file "$IPSET_WHITELIST" "$WHITELIST_FILE" || return 1
-    populate_set_from_file "$IPSET_BLOCKLIST" "$BLOCKLIST_FILE" || return 1
-    populate_cn_set || return 1
-    ensure_chain || return 1
-    iptables -F "$CHAIN" || return 1
+    prepare_staging_chain || return 1
+    if ! build_staging_rules "$mode"; then
+        discard_staging_rules
+        remove_chain "$STAGING_CHAIN" >/dev/null 2>&1 || true
+        unset BUILD_CHAIN
+        red "规则构建失败，原有防火墙规则保持不变。"
+        return 1
+    fi
+    if ! commit_staging_rules; then
+        unset BUILD_CHAIN
+        return 1
+    fi
+    if ! activate_staging_chain; then
+        red "规则切换失败，请执行 blockip --apply 重试。"
+        return 1
+    fi
+    green "规则已应用，当前模式：$(mode_label "$mode")"
+}
+
+build_staging_rules() {
+    local mode=$1
     append_rule -i lo -j ACCEPT || return 1
-    append_rule -m set --match-set "$IPSET_WHITELIST" src -j ACCEPT || return 1
-    append_rule -p icmp --icmp-type echo-request -m set --match-set "$IPSET_BLOCKLIST" src -j DROP || return 1
-    # Evaluate new inbound ping requests before conntrack so an already-running
-    # ping reflects a region switch immediately, while established TCP survives.
+    append_sources_from_file "$WHITELIST_FILE" ACCEPT || return 1
+    # Existing TCP/UDP sessions and replies to pings initiated by this server
+    # remain available. Inbound echo requests still pass through blocking rules.
+    append_rule -p icmp --icmp-type echo-reply -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || return 1
+    append_rule -p icmp --icmp-type destination-unreachable -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || return 1
+    append_rule -p icmp --icmp-type time-exceeded -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || return 1
+    append_rule -p icmp --icmp-type parameter-problem -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || return 1
+    append_rule ! -p icmp -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || return 1
+    append_sources_from_file "$BLOCKLIST_FILE" DROP || return 1
     case "$mode" in
         block_cn)
-            append_rule -p icmp --icmp-type echo-request -m set --match-set "$IPSET_CN" src -j DROP || return 1
+            append_cn_sources DROP || return 1
             ;;
         block_foreign)
-            append_rule -p icmp --icmp-type echo-request -m set --match-set "$IPSET_CN" src -j ACCEPT || return 1
-            append_rule -p icmp --icmp-type echo-request -j DROP || return 1
-            ;;
-        both)
-            append_rule -p icmp --icmp-type echo-request -j DROP || return 1
-            ;;
-    esac
-    append_rule -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || return 1
-    append_rule -m set --match-set "$IPSET_BLOCKLIST" src -j DROP || return 1
-    case "$mode" in
-        block_cn)
-            append_rule -m set --match-set "$IPSET_CN" src -j DROP || return 1
-            ;;
-        block_foreign)
-            append_rule -m set --match-set "$IPSET_CN" src -j ACCEPT || return 1
+            append_cn_sources ACCEPT || return 1
             append_rule -j DROP || return 1
             ;;
         both)
-            # In both mode only the established/local/whitelisted sources survive.
             append_rule -j DROP || return 1
             ;;
         none|*)
             ;;
     esac
-    green "规则已应用，当前模式：$(mode_label "$mode")"
 }
 
 apply_rules() {
@@ -450,8 +540,19 @@ apply_rules() {
 
 apply_and_save() {
     apply_rules || return 1
-    install_systemd_units || return 1
-    green "开机恢复和自动维护已启用。"
+    if ! install_systemd_units; then
+        yellow "当前规则已生效，但开机恢复和自动维护设置失败。"
+        return 0
+    fi
+    if [ "${PERSISTENCE_ENABLED:-0}" -eq 1 ]; then
+        green "开机恢复和自动维护已启用。"
+    else
+        yellow "当前系统未运行 systemd，本次规则已生效，但无法自动恢复和定时更新。"
+    fi
+}
+
+reapply_after_rollback() {
+    apply_rules >/dev/null 2>&1
 }
 
 mode_label() {
@@ -470,8 +571,11 @@ set_mode() {
     printf '%s\n' "$mode" > "$MODE_FILE"
     if ! apply_and_save; then
         printf '%s\n' "$previous" > "$MODE_FILE"
-        apply_rules >/dev/null 2>&1 || true
-        red "操作失败，已恢复之前的开关状态。"
+        if reapply_after_rollback; then
+            red "操作失败，已恢复之前的开关状态。"
+        else
+            red "操作失败，配置已恢复，但防火墙回滚未完成；请执行 blockip --apply。"
+        fi
         return 1
     fi
 }
@@ -516,19 +620,24 @@ toggle_region() {
 
 screen_title() {
     clear 2>/dev/null || true
-    printf '%s\n' '--------------------------------------------------'
-    printf '  %s\n' "$1"
-    printf '%s\n\n' '--------------------------------------------------'
+    printf '%s%s%s\n' "$C_CYAN" '==================================================' "$C_RESET"
+    printf '  %s%s%s\n' "$C_BOLD" "$1" "$C_RESET"
+    printf '%s%s%s\n\n' "$C_CYAN" '==================================================' "$C_RESET"
+}
+
+menu_item() {
+    printf '  %s%s.%s %s\n' "$C_CYAN" "$1" "$C_RESET" "$2"
 }
 
 choose_entry_type() {
-    local choice
-    printf '%s\n' '请选择规则类型：'
-    printf '%s\n' '  1. 单个 IPv4 地址'
-    printf '%s\n' '  2. IPv4 网段（CIDR）'
-    printf '%s\n' '  3. 域名'
-    printf '%s\n\n' '  0. 返回'
-    read -r -p '请输入选项 [0-3]：' choice
+    local choice=''
+    printf '%s\n\n' '请选择规则类型：'
+    menu_item 1 '单个 IPv4 地址'
+    menu_item 2 'IPv4 网段（CIDR）'
+    menu_item 3 '域名'
+    printf '\n'
+    menu_item 0 '返回'
+    read -r -p '请输入选项 [0-3]：' choice || return 1
     case "$choice" in
         1) SELECTED_KIND=IP ;;
         2) SELECTED_KIND=NET ;;
@@ -539,25 +648,32 @@ choose_entry_type() {
 }
 
 read_entry_value() {
-    local kind=$1 value
+    local kind=$1 value=''
     case "$kind" in
-        IP) read -r -p '请输入 IPv4 地址（例如 203.0.113.10）：' value ;;
-        NET) read -r -p '请输入 IPv4 网段（例如 203.0.113.0/24）：' value ;;
-        DOMAIN) read -r -p '请输入域名（例如 example.com）：' value ;;
+        IP) read -r -p '请输入 IPv4 地址（例如 203.0.113.10）：' value || return 1 ;;
+        NET) read -r -p '请输入 IPv4 网段（例如 203.0.113.0/24）：' value || return 1 ;;
+        DOMAIN) read -r -p '请输入域名（例如 example.com）：' value || return 1 ;;
     esac
     value=$(printf '%s' "$value" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
     [ -n "$value" ] || { red '输入不能为空。'; return 1; }
-    if [ "$kind" = DOMAIN ]; then
-        valid_domain "$value" || { red '域名格式不正确。'; return 1; }
-        resolve_domain "$value" | grep -q . || { red '域名没有解析到 IPv4 地址，请检查域名或 DNS。'; return 1; }
-    else
-        valid_ipv4_or_cidr "$value" || { red 'IPv4 地址或网段格式不正确。'; return 1; }
-    fi
+    case "$kind" in
+        IP)
+            valid_ipv4 "$value" || { red 'IPv4 地址格式不正确，请不要填写网段。'; return 1; }
+            ;;
+        NET)
+            valid_cidr "$value" || { red 'IPv4 网段格式不正确，必须包含 /0 到 /32。'; return 1; }
+            ;;
+        DOMAIN)
+            value=${value,,}
+            valid_domain "$value" || { red '域名格式不正确。'; return 1; }
+            resolve_domain "$value" | grep -q . || { red '域名没有解析到 IPv4 地址，请检查域名或 DNS。'; return 1; }
+            ;;
+    esac
     ENTRY_VALUE=$value
 }
 
 add_entry() {
-    local file=$1 title=$2
+    local file=$1 title=$2 backup
     screen_title "$title / 添加"
     choose_entry_type || return
     printf '\n'
@@ -566,8 +682,25 @@ add_entry() {
         yellow '这条规则已经存在，无需重复添加。'
         return
     fi
-    printf '%s|%s\n' "$SELECTED_KIND" "$ENTRY_VALUE" >> "$file"
-    apply_and_save
+    backup=$(mktemp)
+    cp "$file" "$backup" || { rm -f "$backup"; red '无法备份规则文件。'; return; }
+    printf '%s|%s\n' "$SELECTED_KIND" "$ENTRY_VALUE" >> "$file" || {
+        cp "$backup" "$file" 2>/dev/null || true
+        rm -f "$backup"
+        red '无法写入规则文件。'
+        return
+    }
+    if ! apply_and_save; then
+        cp "$backup" "$file"
+        rm -f "$backup"
+        if reapply_after_rollback; then
+            red '规则未生效，添加操作已回滚。'
+        else
+            red '配置已回滚，但防火墙回滚未完成；请执行 blockip --apply。'
+        fi
+        return
+    fi
+    rm -f "$backup"
     green "添加成功：$ENTRY_VALUE"
 }
 
@@ -583,32 +716,48 @@ list_entries() {
 }
 
 delete_entry() {
-    local file=$1 title=$2 line tmp current confirm
+    local file=$1 title=$2 line='' tmp current='' confirm='' backup
     screen_title "$title / 删除"
     list_entries "$file"
     [ -s "$file" ] || return
     printf '\n'
-    read -r -p '请输入要删除的编号 [0=返回]：' line
+    read -r -p '请输入要删除的编号 [0=返回]：' line || return
     [ "$line" = 0 ] && return
     [[ "$line" =~ ^[0-9]+$ ]] || { red '请输入有效的编号。'; return; }
     current=$(sed -n "${line}p" "$file")
     [ -n "$current" ] || { red '找不到这个编号。'; return; }
     printf '即将删除：%s\n' "${current#*|}"
-    read -r -p '确认删除？[y/N]（回车默认 y）：' confirm
+    read -r -p '确认删除？[y/N]（回车默认 y）：' confirm || { yellow '输入已结束，取消删除。'; return; }
     [[ -z "$confirm" || "$confirm" =~ ^[Yy]$ ]] || { yellow '已取消删除。'; return; }
+    backup=$(mktemp)
+    cp "$file" "$backup" || { rm -f "$backup"; red '无法备份规则文件。'; return; }
     tmp=$(mktemp)
-    awk -v n="$line" 'NR != n' "$file" > "$tmp" && mv "$tmp" "$file"
-    apply_and_save
+    if ! awk -v n="$line" 'NR != n' "$file" > "$tmp" || ! mv "$tmp" "$file"; then
+        rm -f "$tmp" "$backup"
+        red '无法更新规则文件。'
+        return
+    fi
+    if ! apply_and_save; then
+        cp "$backup" "$file"
+        rm -f "$backup"
+        if reapply_after_rollback; then
+            red '规则未生效，删除操作已回滚。'
+        else
+            red '配置已回滚，但防火墙回滚未完成；请执行 blockip --apply。'
+        fi
+        return
+    fi
+    rm -f "$backup"
     green '删除成功。'
 }
 
 edit_entry() {
-    local file=$1 title=$2 line tmp current
+    local file=$1 title=$2 line='' tmp current='' backup
     screen_title "$title / 修改"
     list_entries "$file"
     [ -s "$file" ] || return
     printf '\n'
-    read -r -p '请输入要修改的编号 [0=返回]：' line
+    read -r -p '请输入要修改的编号 [0=返回]：' line || return
     [ "$line" = 0 ] && return
     [[ "$line" =~ ^[0-9]+$ ]] || { red '请输入有效的编号。'; return; }
     current=$(sed -n "${line}p" "$file")
@@ -621,85 +770,93 @@ edit_entry() {
         yellow '这条规则已经存在，无需重复添加。'
         return
     fi
+    backup=$(mktemp)
+    cp "$file" "$backup" || { rm -f "$backup"; red '无法备份规则文件。'; return; }
     tmp=$(mktemp)
-    awk -v n="$line" -v replacement="$SELECTED_KIND|$ENTRY_VALUE" 'NR == n { print replacement; next } { print }' "$file" > "$tmp" && mv "$tmp" "$file"
-    apply_and_save
+    if ! awk -v n="$line" -v replacement="$SELECTED_KIND|$ENTRY_VALUE" 'NR == n { print replacement; next } { print }' "$file" > "$tmp" || ! mv "$tmp" "$file"; then
+        rm -f "$tmp" "$backup"
+        red '无法更新规则文件。'
+        return
+    fi
+    if ! apply_and_save; then
+        cp "$backup" "$file"
+        rm -f "$backup"
+        if reapply_after_rollback; then
+            red '规则未生效，修改操作已回滚。'
+        else
+            red '配置已回滚，但防火墙回滚未完成；请执行 blockip --apply。'
+        fi
+        return
+    fi
+    rm -f "$backup"
     green "修改成功：$ENTRY_VALUE"
 }
 
-show_status() {
-    local mode cn_status foreign_status
-    mode=$(tr -d '[:space:]' < "$MODE_FILE" 2>/dev/null || printf none)
-    case "$mode" in
-        block_cn) cn_status='开启'; foreign_status='关闭' ;;
-        block_foreign) cn_status='关闭'; foreign_status='开启' ;;
-        both) cn_status='开启'; foreign_status='开启' ;;
-        *) cn_status='关闭'; foreign_status='关闭' ;;
-    esac
-    printf '\n国内 IP 屏蔽：%s    国外 IP 屏蔽：%s\n' "$cn_status" "$foreign_status"
-    printf '白名单：%s 条    手工屏蔽：%s 条\n' "$(grep -c . "$WHITELIST_FILE" 2>/dev/null || true)" "$(grep -c . "$BLOCKLIST_FILE" 2>/dev/null || true)"
-}
-
 pause_menu() {
+    local _=''
     printf '\n'
-    read -r -p '按 Enter 键继续...' _
+    read -r -p '按 Enter 键继续...' _ || true
 }
 
 manage_entries() {
-    local file=$1 title=$2 choice
+    local file=$1 title=$2 choice=''
     while true; do
         screen_title "$title"
-        list_entries "$file"
-        printf '\n%s\n' '  1. 添加规则'
-        printf '%s\n' '  2. 删除规则'
-        printf '%s\n' '  3. 修改规则'
-        printf '%s\n\n' '  0. 返回主菜单'
-        read -r -p '请输入选项 [0-3]：' choice
+        menu_item 1 '添加规则'
+        menu_item 2 '删除规则'
+        menu_item 3 '修改规则'
+        menu_item 4 '查看规则'
+        printf '\n'
+        menu_item 0 '返回主菜单'
+        read -r -p '请输入选项 [0-4]：' choice || return
         case "$choice" in
             1) add_entry "$file" "$title"; pause_menu ;;
             2) delete_entry "$file" "$title"; pause_menu ;;
             3) edit_entry "$file" "$title"; pause_menu ;;
+            4) screen_title "$title / 查看"; list_entries "$file"; pause_menu ;;
             0) return ;;
-            *) red '请输入 0 到 3 之间的数字。'; sleep 1 ;;
+            *) red '请输入 0 到 4 之间的数字。'; sleep 1 ;;
         esac
     done
 }
 
 uninstall_cleanup() {
-    local confirm
+    local confirm='' firewall_cleanup_ok=1
     screen_title '一键卸载清理'
-    printf '%s\n' '此操作会删除 blockip 创建的防火墙链、ipset、定时任务和配置。'
-    printf '不会卸载系统的 iptables/ipset 软件包，也不会修改其他防火墙链。\n'
-    read -r -p '确认卸载清理？[y/N]：' confirm
+    printf '%s\n' '此操作会删除 blockip 创建的防火墙链、定时任务和配置。'
+    printf '不会卸载系统的 iptables 软件包，也不会修改其他防火墙链。\n'
+    read -r -p '确认卸载清理？[y/N]：' confirm || { yellow '输入已结束，取消卸载。'; return; }
     [[ "$confirm" =~ ^[Yy]$ ]] || { yellow '已取消卸载。'; pause_menu; return; }
 
-    systemctl disable --now blockip-refresh.timer blockip.service >/dev/null 2>&1 || true
+    if have_cmd systemctl && [ -d /run/systemd/system ]; then
+        systemctl disable --now blockip-refresh.timer blockip.service >/dev/null 2>&1 || true
+    fi
     rm -f "$SERVICE_FILE" "$REFRESH_SERVICE_FILE" "$TIMER_FILE"
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    systemctl reset-failed >/dev/null 2>&1 || true
+    if have_cmd systemctl && [ -d /run/systemd/system ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl reset-failed blockip.service blockip-refresh.service blockip-refresh.timer >/dev/null 2>&1 || true
+    fi
     if have_cmd iptables; then
-        while iptables -C INPUT -j "$CHAIN" 2>/dev/null; do iptables -D INPUT -j "$CHAIN"; done
-        iptables -F "$CHAIN" 2>/dev/null || true
-        iptables -X "$CHAIN" 2>/dev/null || true
+        remove_chain "$STAGING_CHAIN" >/dev/null 2>&1 || firewall_cleanup_ok=0
+        remove_chain "$CHAIN" >/dev/null 2>&1 || firewall_cleanup_ok=0
+    else
+        firewall_cleanup_ok=0
     fi
-    if have_cmd ipset; then
-        ipset destroy "$IPSET_WHITELIST" 2>/dev/null || true
-        ipset destroy "$IPSET_BLOCKLIST" 2>/dev/null || true
-        ipset destroy "$IPSET_CN" 2>/dev/null || true
-    fi
-    rm -f /etc/cron.d/blockip "$MODE_FILE" "$WHITELIST_FILE" "$BLOCKLIST_FILE" "$CN_ZONE" "$DEPENDENCY_MARKER"
-    rm -f "$DNS_CACHE_DIR"/* 2>/dev/null || true
-    rmdir "$DNS_CACHE_DIR" 2>/dev/null || true
-    rmdir "$STATE_DIR" 2>/dev/null || true
+    rm -f /etc/cron.d/blockip
+    rm -rf -- "$STATE_DIR"
     rm -f "$BIN_PATH"
-    green 'blockip 程序、规则、配置和 systemd 自动任务已清理。'
+    if [ "$firewall_cleanup_ok" -eq 1 ]; then
+        green 'blockip 程序、规则、配置和 systemd 自动任务已清理。'
+    else
+        yellow '程序和配置已删除，但防火墙链未能完全移除；请检查 iptables 权限后手工清理 BLOCKIP_INPUT。'
+    fi
     exit 0
 }
 
 menu() {
-    local mode cn_enabled foreign_enabled cn_action foreign_action choice confirm
+    local mode cn_enabled foreign_enabled cn_action foreign_action choice='' confirm=''
     while true; do
-        screen_title 'BlockIP 防火墙管理'
+        screen_title "BlockIP 防火墙管理"
         mode=$(tr -d '[:space:]' < "$MODE_FILE")
         cn_enabled=0
         foreign_enabled=0
@@ -710,37 +867,34 @@ menu() {
         esac
         [ "$cn_enabled" -eq 1 ] && cn_action='关闭屏蔽国内 IP' || cn_action='开启屏蔽国内 IP'
         [ "$foreign_enabled" -eq 1 ] && foreign_action='关闭屏蔽国外 IP' || foreign_action='开启屏蔽国外 IP'
-        printf '\n%s\n' "1. $cn_action"
-        printf '%s\n' "2. $foreign_action"
-        printf '%s\n' '3. 白名单管理'
-        printf '%s\n' '4. 手工屏蔽管理'
-        printf '%s\n' '5. 查看当前规则'
-        printf '%s\n' '6. 一键卸载清理'
-        printf '%s\n\n' '0. 退出'
-        read -r -p '请输入选项 [0-6]：' choice
+        menu_item 1 "$cn_action"
+        menu_item 2 "$foreign_action"
+        printf '\n'
+        menu_item 3 '白名单管理'
+        menu_item 4 '手工屏蔽管理'
+        printf '\n'
+        menu_item 5 '一键卸载清理'
+        printf '\n'
+        menu_item 0 '退出'
+        read -r -p '请输入选项 [0-5]：' choice || { printf '\n'; return; }
         case "$choice" in
             1)
                 if [ "$cn_enabled" -eq 1 ]; then toggle_region cn off; else toggle_region cn on; fi
+                pause_menu
                 ;;
             2)
                 if [ "$foreign_enabled" -eq 1 ]; then
                     toggle_region foreign off
                 else
                     yellow '警告：开启后，国外来源的新连接会被拒绝；如果当前已开启国内屏蔽，则两边都会被拒绝。'
-                    read -r -p '确认开启？[y/N]（回车默认 y）：' confirm
+                    read -r -p '确认开启？[y/N]（回车默认 y）：' confirm || confirm='n'
                     [[ -z "$confirm" || "$confirm" =~ ^[Yy]$ ]] && toggle_region foreign on
                 fi
+                pause_menu
                 ;;
             3) manage_entries "$WHITELIST_FILE" '白名单' ;;
             4) manage_entries "$BLOCKLIST_FILE" '手工屏蔽' ;;
-            5)
-                screen_title '当前规则'
-                show_status
-                printf '\n实际防火墙链规则：\n'
-                iptables -S "$CHAIN" 2>/dev/null || yellow '当前还没有应用 blockip 规则。'
-                pause_menu
-                ;;
-            6) uninstall_cleanup ;;
+            5) uninstall_cleanup ;;
             0) exit 0 ;;
             *) red '无效选项。'; sleep 1 ;;
         esac
@@ -753,24 +907,27 @@ main() {
     if [ "$(id -u)" -ne 0 ]; then
         exec sudo -E bash "$0" "$@"
     fi
-    install_self "$@"
     ensure_state
     ensure_dependencies
+    install_self "$@"
     case "${1:-}" in
+        --version)
+            printf '%s %s\n' "$APP_NAME" "$VERSION"
+            exit 0
+            ;;
         --apply)
             apply_rules
             exit $?
             ;;
         --maintenance)
-            mode=$(tr -d '[:space:]' < "$MODE_FILE")
-            case "$mode" in
-                block_cn|block_foreign) ensure_cn_zone || exit 1 ;;
-            esac
             apply_rules
             exit $?
             ;;
     esac
-    install_systemd_units || die "自动恢复服务安装失败。"
+    if ! install_systemd_units; then
+        yellow "自动恢复服务设置失败，仍可使用菜单管理当前防火墙规则。"
+        pause_menu
+    fi
     menu
 }
 
