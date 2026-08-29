@@ -6,7 +6,6 @@ set -u
 
 readonly APP_NAME="blockip"
 readonly CHAIN="BLOCKIP_INPUT"
-readonly CN_URL="https://www.ipdeny.com/ipblocks/data/countries/cn.zone"
 readonly STATE_DIR="/etc/blockip"
 readonly CN_ZONE="${STATE_DIR}/cn.zone"
 readonly MODE_FILE="${STATE_DIR}/mode"
@@ -142,19 +141,8 @@ valid_domain() {
     [[ "$1" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]
 }
 
-download_cn_zone() {
-    require_root
-    ensure_state
-    local tmp="${CN_ZONE}.tmp"
-    if have_cmd curl; then
-        curl -fsSL --connect-timeout 15 --max-time 120 "$CN_URL" -o "$tmp"
-    elif have_cmd wget; then
-        wget -q --timeout=15 -O "$tmp" "$CN_URL"
-    else
-        red "需要 curl 或 wget。"
-        return 1
-    fi || { rm -f "$tmp"; red "国内 IP 列表下载失败，请检查网络后重试。"; return 1; }
-    [ -s "$tmp" ] || { rm -f "$tmp"; red "下载的国内 IP 列表为空。"; return 1; }
+validate_cn_zone_file() {
+    local input=$1 output=$2
     # Portable validation for mawk/busybox awk; do not rely on {n} regex intervals.
     awk '
         function valid_cidr(value, parts, ip, octets, i) {
@@ -169,15 +157,40 @@ download_cn_zone() {
         }
         NF == 1 && valid_cidr($1) { print $1; ok++ }
         END { if (ok < 10) exit 1 }
-    ' "$tmp" > "${tmp}.clean" || {
-        rm -f "$tmp" "${tmp}.clean"
-        red "国内 IP 列表格式异常，未修改现有规则。"
-        return 1
-    }
-    mv "${tmp}.clean" "$CN_ZONE"
-    rm -f "$tmp"
-    chmod 600 "$CN_ZONE"
-    green "国内 IP 列表已更新：$(wc -l < "$CN_ZONE") 个网段。"
+    ' "$input" > "$output"
+}
+
+download_cn_zone() {
+    require_root
+    ensure_state
+    local tmp="${CN_ZONE}.tmp" clean="${CN_ZONE}.clean" url
+    local urls=(
+        'https://www.ipdeny.com/ipblocks/data/countries/cn.zone'
+        'http://www.ipdeny.com/ipblocks/data/countries/cn.zone'
+        'https://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone'
+        'http://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone'
+    )
+    have_cmd curl || have_cmd wget || { red "需要 curl 或 wget。"; return 1; }
+    for url in "${urls[@]}"; do
+        rm -f "$tmp" "$clean"
+        if have_cmd curl; then
+            curl -fsSL --connect-timeout 15 --max-time 120 "$url" -o "$tmp" 2>/dev/null || continue
+        else
+            wget -q --timeout=15 -O "$tmp" "$url" 2>/dev/null || continue
+        fi
+        [ -s "$tmp" ] || continue
+        validate_cn_zone_file "$tmp" "$clean" || continue
+        [ -s "$clean" ] || continue
+        mv "$clean" "$CN_ZONE"
+        rm -f "$tmp"
+        chmod 600 "$CN_ZONE"
+        green "国内 IP 列表已更新：$(wc -l < "$CN_ZONE") 个网段。"
+        return 0
+    done
+    rm -f "$tmp" "$clean"
+    red "国内 IP 列表下载或校验失败，已尝试 HTTPS、HTTP 和聚合列表。"
+    red "未修改现有规则，请稍后重试。"
+    return 1
 }
 
 ensure_cn_zone() {
