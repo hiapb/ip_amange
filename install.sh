@@ -7,6 +7,7 @@ set -u
 readonly APP_NAME="blockip"
 readonly CHAIN="BLOCKIP_INPUT"
 readonly BIN_PATH="/usr/local/sbin/blockip"
+readonly SCRIPT_URL="https://raw.githubusercontent.com/hiapb/ip_amange/main/install.sh"
 readonly STATE_DIR="/etc/blockip"
 readonly CN_ZONE="${STATE_DIR}/cn.zone"
 readonly MODE_FILE="${STATE_DIR}/mode"
@@ -206,12 +207,39 @@ ensure_cn_zone() {
 }
 
 install_self() {
-    local source_path resolved_path
+    local source_path resolved_path install_source tmp=''
     source_path=${BASH_SOURCE[0]}
     resolved_path=$(readlink -f "$source_path" 2>/dev/null || printf '%s' "$source_path")
     if [ "$resolved_path" != "$BIN_PATH" ]; then
-        # Keep the original /dev/fd path readable while running via bash <(curl ...).
-        install -m 755 "$source_path" "$BIN_PATH" || die "无法安装到 $BIN_PATH"
+        install_source=$source_path
+        case "$source_path" in
+            /dev/fd/*|/proc/self/fd/*)
+                tmp=$(mktemp)
+                if have_cmd curl; then
+                    curl -fsSL --connect-timeout 15 --max-time 120 "$SCRIPT_URL" -o "$tmp" || {
+                        rm -f "$tmp"
+                        die "完整脚本下载失败，未执行安装。"
+                    }
+                elif have_cmd wget; then
+                    wget -q --timeout=15 -O "$tmp" "$SCRIPT_URL" || {
+                        rm -f "$tmp"
+                        die "完整脚本下载失败，未执行安装。"
+                    }
+                else
+                    rm -f "$tmp"
+                    die "在线安装需要 curl 或 wget。"
+                fi
+                bash -n "$tmp" || { rm -f "$tmp"; die "下载的脚本语法校验失败，未执行安装。"; }
+                [ -s "$tmp" ] || { rm -f "$tmp"; die "下载的脚本为空，未执行安装。"; }
+                install_source=$tmp
+                ;;
+        esac
+        install -m 755 "$install_source" "$BIN_PATH" || {
+            [ -n "$tmp" ] && rm -f "$tmp"
+            die "无法安装到 $BIN_PATH"
+        }
+        [ -n "$tmp" ] && rm -f "$tmp"
+        bash -n "$BIN_PATH" || { rm -f "$BIN_PATH"; die "安装后的脚本校验失败。"; }
         green "程序已安装/更新：$BIN_PATH"
         green "以后直接运行：blockip"
         exec "$BIN_PATH" "$@"
